@@ -340,6 +340,11 @@ def main():
         default=50,
         help="Max items to scrape (default: 50)",
     )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Overwrite output file instead of merging with existing data",
+    )
 
     args = parser.parse_args()
 
@@ -348,10 +353,20 @@ def main():
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Merge with existing data unless --fresh is specified
+    if not args.fresh and output_path.exists():
+        with open(output_path) as f:
+            existing = json.load(f)
+        existing_titles = {d["title"] for d in existing.get("downloads", [])}
+        new_items = [d for d in result["downloads"] if d["title"] not in existing_titles]
+        # Prepend new items (most recent first)
+        result["downloads"] = new_items + existing["downloads"]
+        print(f"\nMerged {len(new_items)} new items with {len(existing['downloads'])} existing.")
+
     with open(output_path, "w") as f:
         json.dump(result, f, indent=2)
 
-    print(f"\nDone! {len(result['downloads'])} items scraped.")
+    print(f"\nDone! {len(result['downloads'])} total items in output.")
     print(f"Results saved to {output_path}")
 
 
