@@ -34,11 +34,20 @@ def is_download_uri(url: str) -> bool:
     return host in DOWNLOAD_HOSTS or url.startswith("magnet:")
 
 
-def fetch_page(page: Page, url: str, wait_ms: int = 3000) -> BeautifulSoup:
-    """Navigate to a URL and return parsed HTML."""
-    page.goto(url, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(wait_ms)
-    return BeautifulSoup(page.content(), "html.parser")
+def fetch_page(page: Page, url: str, wait_ms: int = 3000, retries: int = 3) -> BeautifulSoup:
+    """Navigate to a URL and return parsed HTML with retry on timeout."""
+    for attempt in range(retries):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(wait_ms)
+            return BeautifulSoup(page.content(), "html.parser")
+        except Exception as e:
+            if attempt < retries - 1:
+                wait = (attempt + 1) * 10
+                print(f"    Retry {attempt + 1}/{retries - 1} after {wait}s: {e}")
+                page.wait_for_timeout(wait * 1000)
+            else:
+                raise
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +278,14 @@ def get_parser(url: str) -> SiteParser:
     return GenericParser()
 
 
-def scrape_site(url: str, max_pages: int, max_items: int) -> dict:
+def save_progress(output_path: Path, site_name: str, downloads: list[dict]):
+    """Save current progress to disk."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump({"name": site_name, "downloads": downloads}, f, indent=2)
+
+
+def scrape_site(url: str, max_pages: int, max_items: int, output_path: Path | None = None) -> dict:
     """Scrape a site: list pages -> individual item pages -> structured data."""
     parser = get_parser(url)
     site_name = parser.name()
@@ -287,7 +303,17 @@ def scrape_site(url: str, max_pages: int, max_items: int) -> dict:
             pages_scraped += 1
             print(f"\n[Page {pages_scraped}] {current_url}")
 
-            soup = fetch_page(page, current_url)
+            try:
+                soup = fetch_page(page, current_url)
+            except Exception as e:
+                print(f"  Failed to load listing page: {e}")
+                print(f"  Skipping to next page...")
+                # Try to construct the next page URL manually
+                current_url = re.sub(r"/page/\d+/", f"/page/{pages_scraped + 1}/", current_url)
+                if f"/page/" not in current_url:
+                    current_url = url.rstrip("/") + f"/page/{pages_scraped + 1}/"
+                continue
+
             game_urls = parser.get_game_urls(soup, current_url)
             print(f"  Found {len(game_urls)} item links")
 
@@ -306,6 +332,10 @@ def scrape_site(url: str, max_pages: int, max_items: int) -> dict:
                         print(f"    -> No download links found, skipping")
                 except Exception as e:
                     print(f"    -> Error: {e}")
+
+            # Save progress after each page
+            if output_path and downloads:
+                save_progress(output_path, site_name, downloads)
 
             if len(downloads) >= max_items:
                 print(f"\nReached max items limit ({max_items})")
@@ -348,10 +378,10 @@ def main():
 
     args = parser.parse_args()
 
-    result = scrape_site(args.url, args.max_pages, args.max_items)
-
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    result = scrape_site(args.url, args.max_pages, args.max_items, output_path)
 
     # Merge with existing data unless --fresh is specified
     if not args.fresh and output_path.exists():
