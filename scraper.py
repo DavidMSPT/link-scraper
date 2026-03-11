@@ -136,15 +136,36 @@ class FitgirlParser(SiteParser):
                 if m:
                     file_size = m.group(1).strip()
 
-        # Download URIs
+        # Download URIs - capture whole-download links, not individual .rar parts
+        # Priority: magnet links, torrent sites, paste links (contain all parts)
         uris = []
         seen = set()
         if entry:
             for a in entry.find_all("a", href=True):
                 href = a["href"].strip()
-                if is_download_uri(href) and href not in seen:
+                if not href or href in seen:
+                    continue
+
+                # Magnet links - single link for full download
+                if href.startswith("magnet:"):
                     seen.add(href)
                     uris.append(href)
+                    continue
+
+                parsed = urlparse(href)
+                host = (parsed.hostname or "").removeprefix("www.")
+
+                # Paste links - contain all part links for a filehoster
+                if host == "paste.fitgirl-repacks.site":
+                    seen.add(href)
+                    uris.append(href)
+                    continue
+
+                # Torrent site links (single page = full download)
+                if host in {"1337x.to", "rutor.info", "tapochek.net"}:
+                    seen.add(href)
+                    uris.append(href)
+                    continue
 
         if not uris:
             return None
