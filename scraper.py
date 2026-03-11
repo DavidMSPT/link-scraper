@@ -22,6 +22,7 @@ DOWNLOAD_HOSTS = {
     "gofile.io", "buzzheavier.com", "vikingfile.com", "datanodes.to",
     "1fichier.com", "filecrypt.cc", "qiwi.gg", "pixeldrain.com",
     "mediafire.com", "mega.nz", "uploadhaven.com", "ddownload.com",
+    "fuckingfast.co", "1337x.to", "rutor.info", "tapochek.net",
 }
 
 
