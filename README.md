@@ -1,6 +1,16 @@
 # Link Scraper
 
-A Python web scraper that extracts download links from any website. Uses Playwright for headless browser rendering, so it works with both static and JavaScript-heavy pages.
+A Python web scraper that deep-crawls websites to extract structured download data. Uses Playwright for headless browser rendering, so it works with both static and JavaScript-heavy pages.
+
+Supports site-specific parsers for accurate extraction of titles, dates, file sizes, and download URIs.
+
+## Supported Sites
+
+| Site | Parser |
+|------|--------|
+| FitGirl Repacks | `FitgirlParser` |
+| SteamRip | `SteamRipParser` |
+| Other sites | `GenericParser` (fallback) |
 
 ## Setup
 
@@ -14,31 +24,33 @@ playwright install chromium
 ## Usage
 
 ```bash
-# Extract download links from a page
-python scraper.py https://example.com/downloads
+# Scrape front page items (default: up to 50 items from 1 page)
+python scraper.py https://fitgirl-repacks.site/
 
-# Extract ALL links (not just downloads)
-python scraper.py https://example.com --all-links
+# Scrape multiple listing pages
+python scraper.py https://fitgirl-repacks.site/ --max-pages 3
 
-# Custom output file with pretty-printed JSON
-python scraper.py https://example.com -o results.json --pretty
+# Limit number of items
+python scraper.py https://fitgirl-repacks.site/ --max-items 10
 
-# Wait extra time for JS-heavy pages
-python scraper.py https://example.com --wait 5
+# Custom output path
+python scraper.py https://fitgirl-repacks.site/ -o output/fitgirl.json
 ```
 
 ## Output Format
 
 ```json
 {
-  "source_url": "https://example.com/downloads",
-  "total": 3,
-  "links": [
+  "name": "FitGirl Repacks",
+  "downloads": [
     {
-      "url": "https://example.com/file.zip",
-      "text": "Download v2.0",
-      "extension": ".zip",
-      "is_download": true
+      "title": "Cities: Skylines - Collection, v1.21.1-f5 + 90 DLCs/Bonuses",
+      "uploadDate": "2026-03-11T11:00:41+03:00",
+      "fileSize": "9.9 GB",
+      "uris": [
+        "https://datanodes.to/.../file.part01.rar",
+        "magnet:?xt=urn:btih:..."
+      ]
     }
   ]
 }
@@ -49,7 +61,15 @@ python scraper.py https://example.com --wait 5
 | Flag | Description |
 |------|-------------|
 | `url` | Target URL to scrape (required) |
-| `-o, --output` | Output JSON file path (default: `links.json`) |
-| `--all-links` | Extract all links, not just download links |
-| `--wait N` | Extra seconds to wait for dynamic content |
-| `--pretty` | Pretty-print JSON output |
+| `-o, --output` | Output JSON file path (default: `output/downloads.json`) |
+| `--max-pages N` | Max listing pages to crawl (default: 1) |
+| `--max-items N` | Max items to scrape (default: 50) |
+
+## Adding a New Site Parser
+
+Subclass `SiteParser` in `scraper.py` and implement:
+- `name()` - display name
+- `matches(url)` - return `True` if this parser handles the URL
+- `get_game_urls(soup, base_url)` - extract item page URLs from listing
+- `parse_game_page(soup, url)` - extract structured data from item page
+- `get_next_page(soup)` - (optional) return next listing page URL

@@ -1,144 +1,358 @@
 #!/usr/bin/env python3
-"""Web scraper that extracts download links from a given URL."""
+"""Web scraper that extracts download links from websites.
+
+Supports deep crawling: visits the homepage to find game/item pages,
+then scrapes each individual page for structured download data.
+"""
 
 import argparse
 import json
+import re
 import sys
+import time
+from abc import ABC, abstractmethod
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, Browser, Page
 
-DOWNLOAD_EXTENSIONS = {
-    # Archives
-    ".zip", ".tar", ".gz", ".bz2", ".7z", ".rar", ".xz", ".tgz",
-    # Executables / installers
-    ".exe", ".msi", ".dmg", ".pkg", ".deb", ".rpm", ".appimage", ".snap",
-    # Documents
-    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".csv", ".odt",
-    # Media
-    ".mp3", ".mp4", ".avi", ".mkv", ".wav", ".flac", ".mov", ".wmv",
-    # Images
-    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".bmp", ".webp", ".tiff",
-    # Data
-    ".json", ".xml", ".yaml", ".yml", ".sql", ".db", ".sqlite",
-    # Code / dev
-    ".whl", ".jar", ".war", ".apk", ".ipa", ".iso", ".img", ".bin",
+# Known file hosting domains whose links count as download URIs
+DOWNLOAD_HOSTS = {
+    "gofile.io", "buzzheavier.com", "vikingfile.com", "datanodes.to",
+    "1fichier.com", "filecrypt.cc", "qiwi.gg", "pixeldrain.com",
+    "mediafire.com", "mega.nz", "uploadhaven.com", "ddownload.com",
 }
 
 
-def is_download_link(url: str) -> bool:
-    """Check if a URL likely points to a downloadable file."""
+def is_download_uri(url: str) -> bool:
+    """Check if a URL points to a file hosting service or direct download."""
     parsed = urlparse(url)
-    path = parsed.path.lower()
-    return any(path.endswith(ext) for ext in DOWNLOAD_EXTENSIONS)
+    host = parsed.hostname or ""
+    # Strip www.
+    host = host.removeprefix("www.")
+    return host in DOWNLOAD_HOSTS or url.startswith("magnet:")
 
 
-def extract_links(html: str, base_url: str, download_only: bool) -> list[dict]:
-    """Extract links from HTML content."""
-    soup = BeautifulSoup(html, "html.parser")
-    links = []
-    seen = set()
-
-    for anchor in soup.find_all("a", href=True):
-        href = anchor["href"].strip()
-        if not href or href.startswith(("#", "javascript:", "mailto:")):
-            continue
-
-        absolute_url = urljoin(base_url, href)
-
-        if absolute_url in seen:
-            continue
-        seen.add(absolute_url)
-
-        text = anchor.get_text(strip=True) or ""
-        is_download = is_download_link(absolute_url)
-
-        # Check for download attribute on the anchor tag
-        has_download_attr = anchor.has_attr("download")
-
-        if download_only and not is_download and not has_download_attr:
-            continue
-
-        parsed = urlparse(absolute_url)
-        ext = Path(parsed.path).suffix.lower() if parsed.path else ""
-
-        links.append({
-            "url": absolute_url,
-            "text": text,
-            "extension": ext,
-            "is_download": is_download or has_download_attr,
-        })
-
-    return links
+def fetch_page(page: Page, url: str, wait_ms: int = 3000) -> BeautifulSoup:
+    """Navigate to a URL and return parsed HTML."""
+    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(wait_ms)
+    return BeautifulSoup(page.content(), "html.parser")
 
 
-def scrape(url: str, download_only: bool, wait_seconds: int) -> list[dict]:
-    """Scrape a URL using a headless browser and extract links."""
+# ---------------------------------------------------------------------------
+# Site parsers
+# ---------------------------------------------------------------------------
+
+class SiteParser(ABC):
+    """Base class for site-specific parsers."""
+
+    @abstractmethod
+    def name(self) -> str:
+        ...
+
+    @abstractmethod
+    def matches(self, url: str) -> bool:
+        ...
+
+    @abstractmethod
+    def get_game_urls(self, soup: BeautifulSoup, base_url: str) -> list[str]:
+        """Extract individual game page URLs from a listing page."""
+        ...
+
+    @abstractmethod
+    def parse_game_page(self, soup: BeautifulSoup, url: str) -> dict | None:
+        """Parse a single game page and return structured data."""
+        ...
+
+    def get_next_page(self, soup: BeautifulSoup) -> str | None:
+        """Return URL for the next listing page, or None."""
+        return None
+
+
+class FitgirlParser(SiteParser):
+    def name(self) -> str:
+        return "FitGirl Repacks"
+
+    def matches(self, url: str) -> bool:
+        return "fitgirl-repacks" in url
+
+    def get_game_urls(self, soup: BeautifulSoup, base_url: str) -> list[str]:
+        urls = []
+        for article in soup.find_all("article"):
+            title_el = article.find(class_=re.compile(r"entry-title"))
+            if not title_el:
+                continue
+            link = title_el.find("a", href=True)
+            if link:
+                href = link["href"]
+                # Skip non-game posts (updates, announcements)
+                if any(skip in href for skip in ["upcoming-repacks", "repack-updated", "donations"]):
+                    continue
+                urls.append(urljoin(base_url, href))
+        return urls
+
+    def get_next_page(self, soup: BeautifulSoup) -> str | None:
+        nav = soup.find("nav", class_="pagination") or soup.find("nav", class_="navigation")
+        if nav:
+            next_link = nav.find("a", class_="next") or nav.find("a", string=re.compile(r"Next|→"))
+            if next_link and next_link.get("href"):
+                return next_link["href"]
+        return None
+
+    def parse_game_page(self, soup: BeautifulSoup, url: str) -> dict | None:
+        # Title
+        title_el = soup.find(class_=re.compile(r"entry-title"))
+        if not title_el:
+            return None
+        title = title_el.get_text(strip=True)
+
+        # Upload date
+        time_el = soup.find("time", datetime=True)
+        upload_date = time_el["datetime"] if time_el else ""
+
+        # File size - look for "Original Size:" or "Repack Size:"
+        entry = soup.find(class_="entry-content")
+        file_size = ""
+        if entry:
+            text = entry.get_text()
+            # Prefer original size
+            m = re.search(r"Original Size:\s*([\d.,]+\s*[GMKT]B)", text, re.IGNORECASE)
+            if m:
+                file_size = m.group(1).strip()
+            else:
+                m = re.search(r"Repack Size:\s*([\d.,]+[/\d.,]*\s*[GMKT]B)", text, re.IGNORECASE)
+                if m:
+                    file_size = m.group(1).strip()
+
+        # Download URIs
+        uris = []
+        seen = set()
+        if entry:
+            for a in entry.find_all("a", href=True):
+                href = a["href"].strip()
+                if is_download_uri(href) and href not in seen:
+                    seen.add(href)
+                    uris.append(href)
+
+        if not uris:
+            return None
+
+        return {
+            "title": title,
+            "uploadDate": upload_date,
+            "fileSize": file_size,
+            "uris": uris,
+        }
+
+
+class SteamRipParser(SiteParser):
+    def name(self) -> str:
+        return "SteamRip"
+
+    def matches(self, url: str) -> bool:
+        return "steamrip" in url
+
+    def get_game_urls(self, soup: BeautifulSoup, base_url: str) -> list[str]:
+        urls = []
+        for a in soup.select("a[href]"):
+            href = a["href"]
+            # SteamRip game pages typically have /game/ or end with -free-download
+            if "-free-download" in href:
+                full = urljoin(base_url, href)
+                if full not in urls:
+                    urls.append(full)
+        return urls
+
+    def get_next_page(self, soup: BeautifulSoup) -> str | None:
+        next_link = soup.find("a", class_="next") or soup.find("a", string=re.compile(r"Next|→|›"))
+        if next_link and next_link.get("href"):
+            return next_link["href"]
+        return None
+
+    def parse_game_page(self, soup: BeautifulSoup, url: str) -> dict | None:
+        title_el = soup.find("h1") or soup.find(class_=re.compile(r"entry-title|post-title"))
+        if not title_el:
+            return None
+        title = title_el.get_text(strip=True)
+
+        time_el = soup.find("time", datetime=True)
+        upload_date = time_el["datetime"] if time_el else ""
+
+        text = soup.get_text()
+        file_size = ""
+        m = re.search(r"File Size:\s*([\d.,]+\s*[GMKT]B)", text, re.IGNORECASE)
+        if m:
+            file_size = m.group(1).strip()
+
+        uris = []
+        seen = set()
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if is_download_uri(href) and href not in seen:
+                seen.add(href)
+                uris.append(href)
+
+        if not uris:
+            return None
+
+        return {
+            "title": title,
+            "uploadDate": upload_date,
+            "fileSize": file_size,
+            "uris": uris,
+        }
+
+
+class GenericParser(SiteParser):
+    """Fallback parser that extracts any download-looking links."""
+
+    def name(self) -> str:
+        host = "Unknown"
+        return host
+
+    def matches(self, url: str) -> bool:
+        return True  # Fallback
+
+    def get_game_urls(self, soup: BeautifulSoup, base_url: str) -> list[str]:
+        urls = []
+        for a in soup.find_all("a", href=True):
+            href = urljoin(base_url, a["href"])
+            parsed = urlparse(href)
+            base_parsed = urlparse(base_url)
+            # Same-domain links with path depth > 1
+            if parsed.hostname == base_parsed.hostname and parsed.path.count("/") > 1:
+                if href not in urls:
+                    urls.append(href)
+        return urls
+
+    def get_next_page(self, soup: BeautifulSoup) -> str | None:
+        next_link = soup.find("a", class_="next") or soup.find("a", rel="next")
+        if next_link and next_link.get("href"):
+            return next_link["href"]
+        return None
+
+    def parse_game_page(self, soup: BeautifulSoup, url: str) -> dict | None:
+        title_el = soup.find("h1")
+        title = title_el.get_text(strip=True) if title_el else urlparse(url).path
+
+        time_el = soup.find("time", datetime=True)
+        upload_date = time_el["datetime"] if time_el else ""
+
+        uris = []
+        seen = set()
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if is_download_uri(href) and href not in seen:
+                seen.add(href)
+                uris.append(href)
+
+        if not uris:
+            return None
+
+        return {
+            "title": title,
+            "uploadDate": upload_date,
+            "fileSize": "",
+            "uris": uris,
+        }
+
+
+PARSERS = [FitgirlParser(), SteamRipParser(), GenericParser()]
+
+
+def get_parser(url: str) -> SiteParser:
+    for parser in PARSERS:
+        if parser.matches(url):
+            return parser
+    return GenericParser()
+
+
+def scrape_site(url: str, max_pages: int, max_items: int) -> dict:
+    """Scrape a site: list pages -> individual item pages -> structured data."""
+    parser = get_parser(url)
+    site_name = parser.name()
+    print(f"Using parser: {site_name}")
+
+    downloads = []
+    pages_scraped = 0
+    current_url = url
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
 
-        print(f"Navigating to {url} ...")
-        page.goto(url, wait_until="networkidle", timeout=60000)
+        while current_url and pages_scraped < max_pages:
+            pages_scraped += 1
+            print(f"\n[Page {pages_scraped}] {current_url}")
 
-        if wait_seconds > 0:
-            print(f"Waiting {wait_seconds}s for dynamic content ...")
-            page.wait_for_timeout(wait_seconds * 1000)
+            soup = fetch_page(page, current_url)
+            game_urls = parser.get_game_urls(soup, current_url)
+            print(f"  Found {len(game_urls)} item links")
 
-        html = page.content()
-        final_url = page.url
+            for i, game_url in enumerate(game_urls):
+                if len(downloads) >= max_items:
+                    break
+
+                print(f"  [{i+1}/{len(game_urls)}] Scraping {game_url[:80]}...")
+                try:
+                    game_soup = fetch_page(page, game_url, wait_ms=2000)
+                    result = parser.parse_game_page(game_soup, game_url)
+                    if result:
+                        downloads.append(result)
+                        print(f"    -> {result['title'][:60]} ({result['fileSize']}, {len(result['uris'])} URIs)")
+                    else:
+                        print(f"    -> No download links found, skipping")
+                except Exception as e:
+                    print(f"    -> Error: {e}")
+
+            if len(downloads) >= max_items:
+                print(f"\nReached max items limit ({max_items})")
+                break
+
+            current_url = parser.get_next_page(soup)
+
         browser.close()
 
-    return extract_links(html, final_url, download_only)
+    return {"name": site_name, "downloads": downloads}
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Scrape download links from a website."
+        description="Scrape download links from a website with deep crawling."
     )
     parser.add_argument("url", help="URL to scrape")
     parser.add_argument(
         "-o", "--output",
-        default="links.json",
-        help="Output JSON file path (default: links.json)",
+        default="output/downloads.json",
+        help="Output JSON file path (default: output/downloads.json)",
     )
     parser.add_argument(
-        "--all-links",
-        action="store_true",
-        help="Extract all links, not just download links",
-    )
-    parser.add_argument(
-        "--wait",
+        "--max-pages",
         type=int,
-        default=0,
-        help="Extra seconds to wait for dynamic content (default: 0)",
+        default=1,
+        help="Max listing pages to crawl (default: 1)",
     )
     parser.add_argument(
-        "--pretty",
-        action="store_true",
-        help="Pretty-print the JSON output",
+        "--max-items",
+        type=int,
+        default=50,
+        help="Max items to scrape (default: 50)",
     )
 
     args = parser.parse_args()
-    download_only = not args.all_links
 
-    links = scrape(args.url, download_only, args.wait)
+    result = scrape_site(args.url, args.max_pages, args.max_items)
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    indent = 2 if args.pretty else None
     with open(output_path, "w") as f:
-        json.dump({"source_url": args.url, "total": len(links), "links": links}, f, indent=indent)
+        json.dump(result, f, indent=2)
 
-    print(f"Found {len(links)} {'links' if args.all_links else 'download links'}.")
+    print(f"\nDone! {len(result['downloads'])} items scraped.")
     print(f"Results saved to {output_path}")
-
-    if not links:
-        mode_hint = "" if args.all_links else " Try --all-links to see all links."
-        print(f"No links found.{mode_hint}")
 
 
 if __name__ == "__main__":
