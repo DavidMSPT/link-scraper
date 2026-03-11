@@ -136,35 +136,16 @@ class FitgirlParser(SiteParser):
                 if m:
                     file_size = m.group(1).strip()
 
-        # Download URIs - direct file host links, magnets, and torrent sites
+        # Download URIs - only magnet links (each = complete game download)
+        # FitGirl splits direct downloads into .rar parts which don't work
+        # as individual entries in download managers like Hydra
         uris = []
-        seen = set()
         if entry:
             for a in entry.find_all("a", href=True):
                 href = a["href"].strip()
-                if not href or href in seen:
-                    continue
-
-                # Magnet links
                 if href.startswith("magnet:"):
-                    seen.add(href)
                     uris.append(href)
-                    continue
-
-                parsed = urlparse(href)
-                host = (parsed.hostname or "").removeprefix("www.")
-
-                # Direct file host links (datanodes, fuckingfast, etc.)
-                if host in DOWNLOAD_HOSTS:
-                    seen.add(href)
-                    uris.append(href)
-                    continue
-
-                # Torrent site links
-                if host in {"1337x.to", "rutor.info", "tapochek.net"}:
-                    seen.add(href)
-                    uris.append(href)
-                    continue
+                    break  # First magnet is enough (duplicates from other trackers)
 
         if not uris:
             return None
